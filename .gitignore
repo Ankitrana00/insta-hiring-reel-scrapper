@@ -1,0 +1,10 @@
+# Secrets — the session cookie and Supabase keys must NEVER be committed
+.env
+
+# Scraped data & review artifacts (public IG captions + your curation)
+out/
+
+# Runtime
+.venv/
+__pycache__/
+*.pyc
