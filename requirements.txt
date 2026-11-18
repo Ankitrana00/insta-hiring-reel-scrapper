@@ -3,3 +3,5 @@
 gallery-dl>=1.29,<2
 requests>=2.31
 python-dotenv>=1.0
+# tests (offline regression suite: python -m pytest tests/)
+pytest>=8
