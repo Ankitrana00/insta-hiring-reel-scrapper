@@ -418,6 +418,78 @@ def test_run_gallerydl_batch_empty_tags_is_noop(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Agent-Reach account lane (opencli)
+# ---------------------------------------------------------------------------
+
+def test_unified_item_to_row_from_post_url():
+    row = reels._unified_item_to_row({
+        "url": "https://www.instagram.com/reel/DebbcBdMoLB/",
+        "content": "Gurgaon (Delhi) #jobopportunity",
+        "created_at": int((datetime.now(timezone.utc) - timedelta(hours=2)).timestamp()),
+        "author": "ncr____job____noida_01",
+    }, "ncr____job____noida_01")
+    assert row["shortcode"] == "DebbcBdMoLB"
+    assert row["media_type"] == "reel"
+    assert row["job_signals"]["is_job_post"] is True
+    assert row["city"] in ("Gurgaon", "Delhi")  # heuristic: first city in list order
+
+
+def test_rows_from_opencli_output_handles_all_shapes():
+    now = datetime.now(timezone.utc)
+    # media-like rows (browser_item_to_row path)
+    rows, err = reels._rows_from_opencli_output(json.dumps({"ok": True, "data": [
+        {"code": "R1", "media_type": 2, "taken_at": int((now - timedelta(hours=2)).timestamp()),
+         "caption": {"text": "hiring in delhi"}, "user": {"username": "a"},
+         "video_versions": [1], "image_versions2": {"candidates": []}}]}), "acc")
+    assert err is None and rows[0]["shortcode"] == "R1" and rows[0]["media_type"] == "reel"
+    # unified rows
+    rows2, err2 = reels._rows_from_opencli_output(json.dumps([
+        {"url": "https://www.instagram.com/reel/R9/", "content": "hiring now",
+         "created_at": int((now - timedelta(hours=3)).timestamp())}]), "acc")
+    assert err2 is None and rows2[0]["shortcode"] == "R9"
+    # error envelope (yaml fallback)
+    rows3, err3 = reels._rows_from_opencli_output(
+        "ok: false\nerror:\n  code: LOGIN_REQUIRED\n  message: login please", "acc")
+    assert rows3 == [] and "login" in err3.lower()
+    # empty output
+    rows4, err4 = reels._rows_from_opencli_output("", "acc")
+    assert rows4 == [] and "browser bridge" in err4
+
+
+def test_cmd_accounts_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setenv("REELS_MAX_AGE_DAYS", "1")
+    monkeypatch.setattr(reels, "load_env", lambda: None)
+    monkeypatch.setattr(reels, "_find_opencli", lambda: "opencli-fake")
+    now = datetime.now(timezone.utc)
+
+    def fake_run(cmd, **kwargs):
+        account = cmd[3]
+        result = type("Proc", (), {"returncode": 0, "stderr": ""})()
+        if account == "careerswala":
+            result.stdout = json.dumps({"ok": True, "data": [
+                {"code": "AR1", "media_type": 2, "taken_at": int((now - timedelta(hours=2)).timestamp()),
+                 "caption": {"text": "hiring in Noida"}, "user": {"username": account},
+                 "video_versions": [1], "image_versions2": {"candidates": []}}]})
+        elif account == "job.shob":
+            result.stdout = json.dumps([
+                {"url": "https://www.instagram.com/reel/AR2/", "content": "hiring in Delhi",
+                 "created_at": int((now - timedelta(hours=3)).timestamp()), "author": account}])
+        else:  # ghost account
+            result.stdout = json.dumps({"ok": False, "error": {"message": "no such account"}})
+        return result
+
+    monkeypatch.setattr(reels.subprocess, "run", fake_run)
+    out = tmp_path / "out"
+    monkeypatch.setattr(reels, "OUT_DIR", out)
+    out.mkdir()
+    ns = type("Args", (), {"accounts": "careerswala,job.shob,ghost", "limit": 6, "timeout": 120,
+                           "all_types": False, "max_age": None})()
+    reels.cmd_accounts(ns)
+    rows = common.read_ndjson(out / f"raw-{date.today():%Y%m%d}.ndjson")
+    assert {r["shortcode"] for r in rows} == {"AR1", "AR2"}  # ghost failed, others kept
+
+
+# ---------------------------------------------------------------------------
 # browser-capture import lane (real XDTMediaDict shapes from live captures)
 # ---------------------------------------------------------------------------
 

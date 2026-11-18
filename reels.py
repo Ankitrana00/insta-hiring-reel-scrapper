@@ -23,11 +23,14 @@ import importlib.util
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 from datetime import date, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import accounts as accounts_watchlist  # noqa: E402
 import common  # noqa: E402
 import watchlist  # noqa: E402
 
@@ -230,6 +233,161 @@ def cmd_import(args: argparse.Namespace) -> None:
         print("NOTE: everything in this capture is older than the freshness window.")
         print("For last-day reels: open the tag page → click the 'Recent' tab → scroll →")
         print("copy that response and import it the same way.")
+    print(f"Raw file:    {raw_path}")
+    print(f"Review file: {review_path}")
+    print(f"Next:        py -3 reels.py review {raw_path.name}")
+
+
+# ---------------------------------------------------------------------------
+# accounts — Agent-Reach browser lane (watch hiring accounts' recent posts)
+# ---------------------------------------------------------------------------
+
+OPENCLI_FALLBACKS = (
+    Path.home() / "AppData" / "Roaming" / "npm" / "opencli",
+    Path.home() / ".local" / "bin" / "opencli",
+)
+
+URL_SHORTCODE_RE = re.compile(r"instagram\.com/(?:reel|reels|p)/([\w-]+)")
+
+
+def _find_opencli() -> str:
+    found = shutil.which("opencli")
+    if found:
+        return found
+    for candidate in OPENCLI_FALLBACKS:
+        if candidate.exists():
+            return str(candidate)
+    sys.exit("opencli not found — run the Agent Reach browser setup first "
+             "(agent-reach setup / agent-reach browser setup)")
+
+
+def _unified_item_to_row(item: dict, account: str) -> dict | None:
+    """Map an OpenCLI unified item (unknown-ish fields) to a row."""
+    url = str(item.get("url") or item.get("link") or "")
+    match = URL_SHORTCODE_RE.search(url)
+    shortcode = match.group(1) if match else item.get("id") or item.get("code")
+    if not shortcode:
+        return None
+    caption = next(
+        (str(item[k]) for k in ("content", "text", "desc", "description", "body") if item.get(k)),
+        "",
+    )
+    posted = next(
+        (item[k] for k in ("created_at", "published_at", "created_utc", "time", "date") if item.get(k)),
+        None,
+    )
+    row = common.browser_item_to_row(
+        {"code": shortcode,
+         "caption": {"text": caption},
+         "taken_at": posted if isinstance(posted, (int, float)) else None,
+         "user": {"username": item.get("author") or item.get("username") or account}},
+        f"@{account}",
+    )
+    if row and "/reel" in url:
+        row["media_type"] = "reel"
+    return row
+
+
+def _rows_from_opencli_output(stdout: str, account: str) -> tuple[list[dict], str | None]:
+    """Parse `opencli instagram user <acc> -f json` output into rows."""
+    text = (stdout or "").strip()
+    if not text:
+        return [], "empty output — is the browser bridge connected? (agent-reach browser setup)"
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        if re.search(r"(?m)^ok:\s*false", text):
+            message = next(
+                (line.split("message:", 1)[1].strip() for line in text.splitlines()
+                 if line.strip().startswith("message:")),
+                text[:200],
+            )
+            return [], message[:300]
+        return [], f"unparseable opencli output: {text[:200]}"
+    if isinstance(data, dict) and data.get("ok") is False:
+        error = data.get("error") or {}
+        return [], str(error.get("message") or "opencli failed")[:300]
+    if isinstance(data, dict):
+        listed = next((data[k] for k in ("items", "data", "result") if isinstance(data.get(k), list)), None)
+        rows_in = listed if listed is not None else []
+    else:
+        rows_in = data if isinstance(data, list) else []
+    rows: list[dict] = []
+    for item in rows_in:
+        if not isinstance(item, dict):
+            continue
+        if ("code" in item or "pk" in item) and ("caption" in item or "taken_at" in item or "image_versions2" in item):
+            row = common.browser_item_to_row(item, f"@{account}")
+        else:
+            row = _unified_item_to_row(item, account)
+        if row:
+            rows.append(row)
+    return rows, None
+
+
+def cmd_accounts(args: argparse.Namespace) -> None:
+    """Agent-Reach lane: watch hiring accounts' recent posts via opencli."""
+    load_env()
+    opencli_bin = _find_opencli()
+    accounts = [a.strip().lstrip("@") for a in (args.accounts.split(",") if args.accounts else accounts_watchlist.ACCOUNTS) if a.strip()]
+
+    OUT_DIR.mkdir(exist_ok=True)
+    today = date.today().strftime("%Y%m%d")
+    raw_path = OUT_DIR / f"raw-{today}.ndjson"
+    seen_shortcodes: set[str] = set()
+    for history in sorted(OUT_DIR.glob("raw-*.ndjson")) + sorted(OUT_DIR.glob("approved-*.ndjson")):
+        for row in common.read_ndjson(history):
+            if row.get("shortcode"):
+                seen_shortcodes.add(str(row["shortcode"]))
+    try:
+        max_age_days = float(args.max_age if args.max_age is not None else os.environ.get("REELS_MAX_AGE_DAYS", "1"))
+    except ValueError:
+        max_age_days = 1.0
+
+    errors: list[str] = []
+    ok = 0
+    for account in accounts:
+        print(f"[@{account}] fetching recent posts via opencli…", flush=True)
+        try:
+            proc = subprocess.run(
+                [opencli_bin, "instagram", "user", account, "--limit", str(args.limit), "-f", "json"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=args.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            errors.append(f"@{account}: timeout after {args.timeout}s")
+            print(f"[@{account}] FAILED — timeout", file=sys.stderr, flush=True)
+            continue
+        except OSError as exc:
+            errors.append(f"@{account}: {exc}")
+            print(f"[@{account}] FAILED — {exc}", file=sys.stderr, flush=True)
+            continue
+        rows, parse_err = _rows_from_opencli_output(proc.stdout, account)
+        if parse_err and not rows:
+            errors.append(f"@{account}: {parse_err}")
+            print(f"[@{account}] FAILED — {parse_err}", file=sys.stderr, flush=True)
+            continue
+        reel_rows, dropped = filter_media(rows, args.all_types)
+        fresh_rows, stale = common.filter_fresh(reel_rows, max_age_days)
+        new_rows = [r for r in fresh_rows if r["shortcode"] not in seen_shortcodes]
+        dup_count = len(fresh_rows) - len(new_rows)
+        common.append_ndjson(raw_path, new_rows)
+        seen_shortcodes.update(r["shortcode"] for r in new_rows)
+        ok += 1
+        total = len(reel_rows) + dropped
+        kind = "posts" if args.all_types else "reels"
+        print(f"[@{account}] {len(fresh_rows)}/{total} {kind} kept ({stale} older than {max_age_days:g}d, "
+              f"{dup_count} seen before, {len(new_rows)} new)", flush=True)
+
+    all_rows = common.read_ndjson(raw_path)
+    review_path = OUT_DIR / f"review-{today}.html"
+    common.render_review_html(all_rows, review_path)
+
+    print(f"\nAccounts: {len(accounts)} — ok {ok}, failed {len(errors)}")
+    if errors:
+        err_log = OUT_DIR / f"errors-{today}.log"
+        err_log.write_text("\n".join(errors) + "\n", encoding="utf-8")
+        print(f"Error details: {err_log}")
     print(f"Raw file:    {raw_path}")
     print(f"Review file: {review_path}")
     print(f"Next:        py -3 reels.py review {raw_path.name}")
@@ -446,6 +604,14 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--max-age", type=float, default=None,
                      help="keep only posts from the last N days (default 1; REELS_MAX_AGE_DAYS overrides)")
     imp.set_defaults(func=cmd_import)
+
+    acc = sub.add_parser("via-accounts", help="Agent-Reach lane: watch hiring accounts' recent posts (opencli)")
+    acc.add_argument("--accounts", default=None, help="comma-separated handles (default: accounts.py watchlist)")
+    acc.add_argument("--limit", type=int, default=6, help="posts per account (default 6)")
+    acc.add_argument("--timeout", type=float, default=120, help="seconds per account (default 120)")
+    acc.add_argument("--all-types", action="store_true", help="also keep non-reel posts (default: reels only)")
+    acc.add_argument("--max-age", type=float, default=None, help="keep only posts from the last N days (default 1)")
+    acc.set_defaults(func=cmd_accounts)
     return parser
 
 
