@@ -290,6 +290,106 @@ def post_url_for(row: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Browser-capture import — parse JSON copied from instagram.com's own
+# Network tab (works for ANY response shape: search SERP, tag pages, feeds)
+# ---------------------------------------------------------------------------
+
+
+def _looks_like_media_item(obj: dict) -> bool:
+    return (
+        isinstance(obj, dict)
+        and ("code" in obj or "pk" in obj)
+        and ("caption" in obj or "taken_at" in obj or "image_versions2" in obj)
+    )
+
+
+def iter_media_items(payload) -> list[dict]:
+    """Recursively collect media-like dicts from any Instagram JSON response.
+
+    Instagram wraps the same media objects in many different envelopes
+    (search SERP `XDTMediaDict`, tag `sections`, feeds, carousels) — instead
+    of chasing each shape, walk the whole payload and keep every dict that
+    looks like a post, deduped by code/pk.
+    """
+    found: dict[str, dict] = {}
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            if _looks_like_media_item(node):
+                key = str(node.get("code") or node.get("pk"))
+                if key and key not in found:
+                    found[key] = node
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(payload)
+    return list(found.values())
+
+
+def browser_item_to_row(item: dict, hashtag: str) -> dict | None:
+    """One browser-captured media dict → one job_reels-shaped row (or None).
+
+    Field names in browser GraphQL (`XDTMediaDict`): `code`, `taken_at`,
+    `caption.text`, `user.username`, `image_versions2.candidates`,
+    `video_versions`, `media_type` (1 image, 2 video, 8 carousel).
+    """
+    code = item.get("code") or item.get("shortcode") or item.get("post_shortcode")
+    if not code:
+        return None
+    caption = item.get("caption")
+    if isinstance(caption, dict):
+        caption = caption.get("text")
+    caption_text = caption.strip() if isinstance(caption, str) else ""
+    if item.get("carousel_media") or item.get("media_type") == 8:
+        media_type = "carousel"
+    elif item.get("media_type") == 2 and item.get("video_versions"):
+        media_type = "reel"
+    elif item.get("media_type") == 2 or item.get("video_versions"):
+        media_type = "video"
+    else:
+        media_type = "post"
+    user = item.get("user") or {}
+    candidates = (item.get("image_versions2") or {}).get("candidates") or []
+    sized = [c for c in candidates if c.get("width")]
+    thumbnail = (min(sized, key=lambda c: c["width"]) if sized else None) or candidates[-1] if candidates else None
+    taken = item.get("taken_at")
+    posted_at = (
+        datetime.fromtimestamp(taken, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        if isinstance(taken, (int, float)) and not isinstance(taken, bool) and taken > 0
+        else None
+    )
+    signals = parse_caption(caption_text)
+    if item.get("like_count") is not None:
+        signals["likes"] = item.get("like_count")
+    return {
+        "shortcode": str(code),
+        "media_type": media_type,
+        "hashtag_source": hashtag,
+        "owner_username": user.get("username"),
+        "owner_fullname": user.get("full_name"),
+        "caption": caption_text[:4000] or None,
+        "city": signals.get("city"),
+        "job_signals": signals,
+        "thumbnail_url": (thumbnail or {}).get("url") if isinstance(thumbnail, dict) else thumbnail,
+        "posted_at": posted_at,
+        "post_url": f"https://www.instagram.com/{'reel' if media_type in ('reel', 'igtv') else 'p'}/{code}/",
+    }
+
+
+def rows_from_browser_capture(payload, hashtag: str) -> list[dict]:
+    """Any captured Instagram JSON → job_reels-shaped rows."""
+    rows: list[dict] = []
+    for item in iter_media_items(payload):
+        row = browser_item_to_row(item, hashtag)
+        if row:
+            rows.append(row)
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Freshness filter — the daily-curation goal: only recently-posted reels
 # ---------------------------------------------------------------------------
 

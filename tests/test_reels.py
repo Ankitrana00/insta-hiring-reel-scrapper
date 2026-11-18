@@ -418,6 +418,88 @@ def test_run_gallerydl_batch_empty_tags_is_noop(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# browser-capture import lane (real XDTMediaDict shapes from live captures)
+# ---------------------------------------------------------------------------
+
+def _browser_capture():
+    now = datetime.now(timezone.utc)
+    return {"data": {"xdt_fbsearch__top_serp_graphql": {"edges": [{"node": {"items": [
+        {"__typename": "XDTMediaDict", "pk": "3972782229340002889", "code": "DciKGONy5pJ",
+         "media_type": 2, "taken_at": int((now - timedelta(hours=2)).timestamp()),
+         "user": {"username": "gutsymonks", "full_name": "Gutsy Monk"},
+         "caption": {"text": "WE ARE HIRING! Tele Callers in Vikaspuri Delhi #delhijobs"},
+         "image_versions2": {"candidates": [
+             {"url": "https://thumb/240.jpg", "width": 240},
+             {"url": "https://thumb/640.jpg", "width": 640},
+             {"url": "https://thumb/1080.jpg", "width": 1080}]},
+         "video_versions": [{"url": "https://v.mp4"}], "like_count": 2790},
+        {"code": "IMG1", "media_type": 1, "taken_at": int((now - timedelta(hours=3)).timestamp()),
+         "user": {"username": "p"}, "caption": {"text": "sunset mumbai"},
+         "image_versions2": {"candidates": [{"url": "https://t/1.jpg", "width": 640}]},
+         "video_versions": None, "like_count": None},
+    ]}}]}}}
+
+
+def test_browser_capture_walker_finds_items_in_any_shape():
+    capture = {"a": [_browser_capture(), {"nested": {"deeper": [{"code": "X1", "taken_at": 1}]}}]}
+    items = common.iter_media_items(capture)
+    codes = {i["code"] for i in items}
+    assert {"DciKGONy5pJ", "IMG1", "X1"} <= codes  # walks any nesting depth
+
+
+def test_browser_capture_rows_mapped_correctly():
+    rows = common.rows_from_browser_capture(_browser_capture(), "delhijobs")
+    assert len(rows) == 2
+    reel = next(r for r in rows if r["shortcode"] == "DciKGONy5pJ")
+    assert reel["media_type"] == "reel"
+    assert reel["owner_username"] == "gutsymonks"
+    assert "WE ARE HIRING" in reel["caption"]
+    assert reel["city"] == "Delhi"
+    assert reel["posted_at"].endswith("Z")
+    assert reel["thumbnail_url"] == "https://thumb/640.jpg"  # smallest candidate ≥320w
+    assert reel["job_signals"]["likes"] == 2790
+    assert reel["post_url"].endswith("/reel/DciKGONy5pJ/")
+    img = next(r for r in rows if r["shortcode"] == "IMG1")
+    assert img["media_type"] == "post"
+
+
+def test_cmd_import_browser_capture_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setenv("REELS_MAX_AGE_DAYS", "1")
+    monkeypatch.setattr(reels, "load_env", lambda: None)
+    out = tmp_path / "out"
+    monkeypatch.setattr(reels, "OUT_DIR", out)
+    out.mkdir()
+    f = out / "tagdump.json"
+    f.write_text(json.dumps(_browser_capture()), encoding="utf-8")
+
+    ns = type("Args", (), {"file": str(f), "tag": "delhijobs", "all_types": False,
+                           "max_age": None})()
+    reels.cmd_import(ns)  # the capture is hours old → passes the 1-day gate
+    rows = common.read_ndjson(out / f"raw-{date.today():%Y%m%d}.ndjson")
+    assert {r["shortcode"] for r in rows} == {"DciKGONy5pJ"}  # reels-only: IMG1 dropped
+    assert rows[0]["job_signals"]["is_job_post"] is True
+
+
+def test_cmd_import_freshness_gate_drops_old_capture(tmp_path, monkeypatch):
+    monkeypatch.delenv("REELS_MAX_AGE_DAYS", raising=False)
+    monkeypatch.setattr(reels, "load_env", lambda: None)
+    out = tmp_path / "out"
+    monkeypatch.setattr(reels, "OUT_DIR", out)
+    out.mkdir()
+    old = json.loads(json.dumps(_browser_capture()))
+    items = old["data"]["xdt_fbsearch__top_serp_graphql"]["edges"][0]["node"]["items"]
+    for item in items:  # push every captured post 30 days into the past
+        item["taken_at"] = int((datetime.now(timezone.utc) - timedelta(days=30)).timestamp())
+    f = out / "tagdump.json"
+    f.write_text(json.dumps(old), encoding="utf-8")
+
+    ns = type("Args", (), {"file": str(f), "tag": "delhijobs", "all_types": False,
+                           "max_age": None})()
+    reels.cmd_import(ns)
+    assert common.read_ndjson(out / f"raw-{date.today():%Y%m%d}.ndjson") == []  # gate held
+
+
+# ---------------------------------------------------------------------------
 # daily rotation
 # ---------------------------------------------------------------------------
 

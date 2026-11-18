@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import re
 import sys
@@ -167,6 +168,68 @@ def cmd_scrape(args: argparse.Namespace) -> None:
         err_log = OUT_DIR / f"errors-{today}.log"
         err_log.write_text("\n".join(errors) + "\n", encoding="utf-8")
         print(f"Error details: {err_log}")
+    print(f"Raw file:    {raw_path}")
+    print(f"Review file: {review_path}")
+    print(f"Next:        py -3 reels.py review {raw_path.name}")
+
+
+# ---------------------------------------------------------------------------
+# import — browser-captured JSON (the workaround lane when the API lane dies)
+# ---------------------------------------------------------------------------
+
+
+def cmd_import(args: argparse.Namespace) -> None:
+    load_env()
+    src = Path(args.file)
+    if not src.exists():
+        sys.exit(f"Not found: {src}")
+    raw_text = src.read_text(encoding="utf-8")
+    if raw_text.lstrip().startswith("for (;;);"):
+        raw_text = raw_text.split(";", 1)[1]  # legacy IG response guard
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        sys.exit(f"{src.name} is not valid JSON ({exc}) — copy the RESPONSE body only, not the headers")
+
+    captured = common.rows_from_browser_capture(payload, args.tag or "browser-capture")
+    if not captured:
+        sys.exit("No media items found in that capture — copy the response of a request that returns posts")
+
+    OUT_DIR.mkdir(exist_ok=True)
+    today = date.today().strftime("%Y%m%d")
+    raw_path = OUT_DIR / f"raw-{today}.ndjson"
+    seen_shortcodes: set[str] = set()
+    for history in sorted(OUT_DIR.glob("raw-*.ndjson")) + sorted(OUT_DIR.glob("approved-*.ndjson")):
+        for row in common.read_ndjson(history):
+            if row.get("shortcode"):
+                seen_shortcodes.add(str(row["shortcode"]))
+
+    try:
+        max_age_days = float(args.max_age if args.max_age is not None else os.environ.get("REELS_MAX_AGE_DAYS", "1"))
+    except ValueError:
+        max_age_days = 1.0
+
+    reel_rows, dropped = filter_media(captured, args.all_types)
+    fresh_rows, stale = common.filter_fresh(reel_rows, max_age_days)
+    new_rows = [r for r in fresh_rows if r["shortcode"] not in seen_shortcodes]
+    dup_count = len(fresh_rows) - len(new_rows)
+    common.append_ndjson(raw_path, new_rows)
+    seen_shortcodes.update(r["shortcode"] for r in new_rows)
+
+    all_rows = common.read_ndjson(raw_path)
+    review_path = OUT_DIR / f"review-{today}.html"
+    common.render_review_html(all_rows, review_path)
+
+    kind = "posts" if args.all_types else "reels"
+    parts = [f"{stale} older than {max_age_days:g}d", f"{dup_count} seen before", f"{len(new_rows)} new"]
+    if not args.all_types:
+        parts.insert(0, f"{dropped} non-reel dropped")
+    print(f"Captured {len(captured)} media items from {src.name}")
+    print(f"→ {len(new_rows)}/{len(captured)} {kind} imported ({', '.join(parts)})")
+    if stale and not new_rows:
+        print("NOTE: everything in this capture is older than the freshness window.")
+        print("For last-day reels: open the tag page → click the 'Recent' tab → scroll →")
+        print("copy that response and import it the same way.")
     print(f"Raw file:    {raw_path}")
     print(f"Review file: {review_path}")
     print(f"Next:        py -3 reels.py review {raw_path.name}")
@@ -375,6 +438,14 @@ def build_parser() -> argparse.ArgumentParser:
     push.add_argument("file", help="out/approved-<date>.ndjson")
     push.add_argument("--status", choices=["active", "pending"], default="active", help="row status (default active)")
     push.set_defaults(func=cmd_push)
+
+    imp = sub.add_parser("import", help="import a browser-captured Instagram JSON file (Network-tab response)")
+    imp.add_argument("file", help="path to the captured JSON (any Instagram response shape)")
+    imp.add_argument("--tag", default=None, help="label for hashtag_source (default: browser-capture)")
+    imp.add_argument("--all-types", action="store_true", help="also keep image/carousel/video posts (default: reels only)")
+    imp.add_argument("--max-age", type=float, default=None,
+                     help="keep only posts from the last N days (default 1; REELS_MAX_AGE_DAYS overrides)")
+    imp.set_defaults(func=cmd_import)
     return parser
 
 
