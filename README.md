@@ -116,7 +116,7 @@ every keyword-hit row without prompts (fast, but it will keep meme/advice
 posts — the manual pass exists for a reason). Without Supabase configured,
 approved rows simply stay local; the tool says so.
 
-###  — browser-capture lane (workaround when Instagram's API breaks)
+### `import` — browser-capture lane (workaround when Instagram's API breaks)
 
 If Instagram kills the internal API again (like on 2026-11-18, when
 `/api/v1/tags/<tag>/sections/` started 404ing for every session), the data
