@@ -261,6 +261,59 @@ def _find_opencli() -> str:
              "(agent-reach setup / agent-reach browser setup)")
 
 
+EVAL_SCRIPTS_JS = (
+    '(() => { const s = [...document.querySelectorAll(' + chr(39) + 'script[type="application/json"]' + chr(39) + ')]; '
+    'return JSON.stringify(s.map(x => x.textContent)); })()'
+)
+
+
+def _extract_live_account_rows(opencli_bin: str, account: str, timeout: float,
+                               session: str = "ig") -> tuple[list[dict], str | None]:
+    """Navigate the bound browser to the profile and pull the hydrated JSON.
+
+    The profile page embeds every post (code, caption.text, taken_at,
+    image_versions2, video_versions) in <script type="application/json">
+    after hydration — DOM data, not API routes, so Instagram's API removal
+    does not affect it. Public profiles render without login; private ones
+    need the watch account logged in.
+    """
+    nav = subprocess.run(
+        [opencli_bin, "browser", "open", "--session", session,
+         f"https://www.instagram.com/{account}/"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=timeout,
+    )
+    if nav.returncode != 0:
+        return [], f"browser navigation failed: {(nav.stderr or nav.stdout or '')[:200]}"
+    proc = subprocess.run(
+        [opencli_bin, "browser", "eval", "--session", session, EVAL_SCRIPTS_JS],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=timeout,
+    )
+    try:
+        envelope = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        return [], f"unparseable eval output: {(proc.stdout or '')[:200]}"
+    if not envelope.get("ok"):
+        return [], f"page eval failed: {str(envelope.get('error'))[:200]}"
+    try:
+        scripts = json.loads(envelope.get("data") or "[]")
+    except json.JSONDecodeError:
+        return [], "eval returned non-JSON script list"
+    rows: list[dict] = []
+    for text in scripts:
+        try:
+            doc = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        rows.extend(common.rows_from_browser_capture(doc, f"@{account}"))
+    # dedupe by shortcode (hydration can repeat items across scripts)
+    unique: dict[str, dict] = {}
+    for row in rows:
+        unique.setdefault(row["shortcode"], row)
+    return list(unique.values()), None
+
+
 def _unified_item_to_row(item: dict, account: str) -> dict | None:
     """Map an OpenCLI unified item (unknown-ish fields) to a row."""
     url = str(item.get("url") or item.get("link") or "")
@@ -347,13 +400,9 @@ def cmd_accounts(args: argparse.Namespace) -> None:
     errors: list[str] = []
     ok = 0
     for account in accounts:
-        print(f"[@{account}] fetching recent posts via opencli…", flush=True)
+        print(f"[@{account}] opening profile and extracting hydrated posts…", flush=True)
         try:
-            proc = subprocess.run(
-                [opencli_bin, "instagram", "user", account, "--limit", str(args.limit), "-f", "json"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=args.timeout,
-            )
+            rows, parse_err = _extract_live_account_rows(opencli_bin, account, args.timeout)
         except subprocess.TimeoutExpired:
             errors.append(f"@{account}: timeout after {args.timeout}s")
             print(f"[@{account}] FAILED — timeout", file=sys.stderr, flush=True)
@@ -362,7 +411,6 @@ def cmd_accounts(args: argparse.Namespace) -> None:
             errors.append(f"@{account}: {exc}")
             print(f"[@{account}] FAILED — {exc}", file=sys.stderr, flush=True)
             continue
-        rows, parse_err = _rows_from_opencli_output(proc.stdout, account)
         if parse_err and not rows:
             errors.append(f"@{account}: {parse_err}")
             print(f"[@{account}] FAILED — {parse_err}", file=sys.stderr, flush=True)

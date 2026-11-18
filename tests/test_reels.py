@@ -462,20 +462,27 @@ def test_cmd_accounts_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setattr(reels, "_find_opencli", lambda: "opencli-fake")
     now = datetime.now(timezone.utc)
 
+    def media(code, hours_old):
+        return {"code": code, "media_type": 2, "taken_at": int((now - timedelta(hours=hours_old)).timestamp()),
+                "caption": {"text": "hiring in Noida #delhijobs"}, "user": {"username": "acc"},
+                "video_versions": [1], "image_versions2": {"candidates": [{"url": "https://t/1.jpg", "width": 640}]}}
+
+    state = {"last_account": None}
+
     def fake_run(cmd, **kwargs):
-        account = cmd[3]
         result = type("Proc", (), {"returncode": 0, "stderr": ""})()
-        if account == "careerswala":
-            result.stdout = json.dumps({"ok": True, "data": [
-                {"code": "AR1", "media_type": 2, "taken_at": int((now - timedelta(hours=2)).timestamp()),
-                 "caption": {"text": "hiring in Noida"}, "user": {"username": account},
-                 "video_versions": [1], "image_versions2": {"candidates": []}}]})
-        elif account == "job.shob":
-            result.stdout = json.dumps([
-                {"url": "https://www.instagram.com/reel/AR2/", "content": "hiring in Delhi",
-                 "created_at": int((now - timedelta(hours=3)).timestamp()), "author": account}])
-        else:  # ghost account
-            result.stdout = json.dumps({"ok": False, "error": {"message": "no such account"}})
+        if "open" in cmd:  # browser open --session ig <profile-url>
+            state["last_account"] = cmd[-1].rstrip("/").rsplit("/", 1)[-1]
+            result.stdout = json.dumps({"ok": True, "data": {"url": cmd[-1]}})
+        else:  # browser eval — return hydrated scripts for the last-opened account
+            account = state["last_account"]
+            if account == "careerswala":
+                scripts = [json.dumps({"items": [media("AR1", 2)]})]
+            elif account == "job.shob":
+                scripts = [json.dumps({"items": [media("AR2", 3)]})]
+            else:  # ghost account — page renders but no media
+                scripts = [json.dumps({"shell": True})]
+            result.stdout = json.dumps({"ok": True, "data": json.dumps(scripts)})
         return result
 
     monkeypatch.setattr(reels.subprocess, "run", fake_run)
@@ -486,7 +493,7 @@ def test_cmd_accounts_end_to_end(tmp_path, monkeypatch):
                            "all_types": False, "max_age": None})()
     reels.cmd_accounts(ns)
     rows = common.read_ndjson(out / f"raw-{date.today():%Y%m%d}.ndjson")
-    assert {r["shortcode"] for r in rows} == {"AR1", "AR2"}  # ghost failed, others kept
+    assert {r["shortcode"] for r in rows} == {"AR1", "AR2"}  # ghost has no media, others kept
 
 
 # ---------------------------------------------------------------------------
