@@ -116,6 +116,27 @@ every keyword-hit row without prompts (fast, but it will keep meme/advice
 posts — the manual pass exists for a reason). Without Supabase configured,
 approved rows simply stay local; the tool says so.
 
+###  — browser-capture lane (workaround when Instagram's API breaks)
+
+If Instagram kills the internal API again (like on 2026-11-18, when
+`/api/v1/tags/<tag>/sections/` started 404ing for every session), the data
+still flows through your **logged-in browser**:
+
+1. Open the tag page (e.g. `instagram.com/explore/tags/delhijobs/`) and click
+   the **Recent** tab
+2. F12 → **Network** tab → filter `graphql` → scroll the grid
+3. Right-click a request whose **Response** contains captions → **Copy → Copy response**
+4. Save it into `out/` as any `.json` file, then:
+
+```bash
+.venv/Scripts/python reels.py import out/tagdump.json --tag delhijobs
+```
+
+The importer walks ANY Instagram response shape (search results, tag pages,
+feeds), maps every post to the row contract, and applies the same gates as
+`scrape`: reels-only filter, freshness window, cross-day dedupe — then the
+normal review → push flow.
+
 ### Supabase push — OPTIONAL (currently deferred)
 
 Fill `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` in `.env` and apply the
