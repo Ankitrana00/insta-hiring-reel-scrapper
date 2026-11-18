@@ -17,10 +17,10 @@ machine; a residential IP is also the least ban-prone way to talk to Instagram.
 ## How it works
 
 ```
-watchlist.py (47 India hiring hashtags)
-        │  daily batch = 10 tags, rotated by day-of-year (full cycle every 5 days)
+watchlist.py (40 India hiring hashtags)
+        │  daily batch = 10 tags, rotated by day-of-year (full cycle every 4 days)
         ▼
-gdl_run.py ── in-process gallery-dl runner
+gdl_run.py ── ONE runner process for the WHOLE tag batch
         │    fetches the hashtag "clips" tab (where REELS live — the stock
         │    gallery-dl runner only walks the "recent" image grid)
         ▼
@@ -44,8 +44,8 @@ public.job_reels (Supabase) → the app's S9 board reads it
 | --- | --- |
 | `reels.py` | CLI entry — `scrape` / `review` / `push` subcommands |
 | `common.py` | gallery-dl output parser, post grouping, caption→job-signals, review-HTML generator |
-| `gdl_run.py` | in-process gallery-dl runner — fetches the **clips tab**; prints the same JSON envelope `gallery-dl -j` would |
-| `watchlist.py` | the 47 India hiring hashtags for the daily rotation |
+| `gdl_run.py` | in-process gallery-dl runner — runs the whole tag batch in ONE process (interpreter + import cost paid once); fetches the **clips tab**; emits per-tag `@@@TAG:` envelopes |
+| `watchlist.py` | the 40 India hiring hashtags for the daily rotation |
 | `requirements.txt` | `gallery-dl`, `requests`, `python-dotenv` |
 | `.env` | **secrets** — sessionid (+ optional Supabase keys). Never leaves this folder |
 | `.env.example` | template documenting every variable |

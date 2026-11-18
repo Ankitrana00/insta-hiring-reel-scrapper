@@ -121,15 +121,25 @@ def cmd_scrape(args: argparse.Namespace) -> None:
     config_path = OUT_DIR / "config.json"
     common.write_gallerydl_config(config_path, session_id, max_posts)
 
-    errors: list[str] = []
-    ok = skipped = 0
+    # skip tags already scraped today BEFORE the batch — no wasted requests
+    pending_tags: list[str] = []
+    skipped = 0
     for tag in tags:
         if tag in done_tags and not args.force:
             print(f"[{tag}] already scraped today — skipped (--force to redo)")
             skipped += 1
-            continue
-        print(f"[{tag}] fetching metadata (max {max_posts} posts)…", flush=True)
-        items, err = common.run_gallerydl_tag(config_path, tag, tag_timeout, tabs=tabs)
+        else:
+            pending_tags.append(tag)
+
+    results: dict[str, tuple[list[dict], str | None]] = {}
+    if pending_tags:
+        print(f"Fetching {len(pending_tags)} tag(s) in one runner batch…", flush=True)
+        results = common.run_gallerydl_batch(config_path, pending_tags, tag_timeout, tabs=tabs)
+
+    errors: list[str] = []
+    ok = 0
+    for tag in pending_tags:
+        items, err = results.get(tag, ([], "no result — runner did not report this tag"))
         if err:
             errors.append(f"{tag}: {err}")
             print(f"[{tag}] FAILED — {err}", file=sys.stderr, flush=True)

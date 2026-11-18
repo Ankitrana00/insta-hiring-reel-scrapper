@@ -368,18 +368,30 @@ def write_gallerydl_config(path: Path, session_id: str, max_posts: int) -> None:
 
 
 GDL_RUNNER = Path(__file__).resolve().parent / "gdl_run.py"
+BATCH_TAG_PREFIX = "@@@TAG:"
 
 
 def run_gallerydl_tag(config_path: Path, tag: str, timeout: float,
                       tabs: tuple[str, ...] = ("clips",)) -> tuple[list[dict], str | None]:
-    """Run the in-process runner for one hashtag page. Returns (items, error).
+    """Single-tag convenience wrapper around run_gallerydl_batch."""
+    return run_gallerydl_batch(config_path, [tag], timeout, tabs=tabs)[tag]
+
+
+def run_gallerydl_batch(config_path: Path, tags: list[str], timeout_per_tag: float,
+                        tabs: tuple[str, ...] = ("clips",)
+                        ) -> dict[str, tuple[list[dict], str | None]]:
+    """Run ONE runner process for ALL tags. Returns {tag: (items, error)}.
 
     Default tab is "clips" — that is where hashtag REELS live; the stock
     `gallery-dl -j` runner only fetches the "recent" grid, which our live test
-    showed yields ~0 reels on hiring tags. Pass "recent,clips" with --all-types.
+    showed yields ~0 reels on hiring tags. Per-tag failures stay isolated via
+    the runner's `@@@TAG:` separators; the batch timeout (per-tag × count) is
+    only a backstop for a hung process.
     """
-    url = f"https://www.instagram.com/explore/tags/{tag}/"
-    cmd = [sys.executable, str(GDL_RUNNER), str(config_path), url, ",".join(tabs)]
+    if not tags:
+        return {}
+    cmd = [sys.executable, str(GDL_RUNNER), str(config_path), ",".join(tags), ",".join(tabs)]
+    total_timeout = timeout_per_tag * len(tags) + 30
     try:
         proc = subprocess.run(
             cmd,
@@ -387,17 +399,45 @@ def run_gallerydl_tag(config_path: Path, tag: str, timeout: float,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout,
+            timeout=total_timeout,
         )
     except subprocess.TimeoutExpired:
-        return [], f"timeout after {timeout:.0f}s"
+        return {tag: ([], f"batch timeout after {total_timeout:.0f}s") for tag in tags}
     except OSError as exc:
-        return [], f"failed to launch gallery-dl: {exc}"
-    if proc.returncode != 0:
+        return {tag: ([], f"failed to launch gallery-dl: {exc}") for tag in tags}
+    if proc.returncode != 0 and not (proc.stdout or "").strip():
+        # runner-level crash before producing anything → fail the whole batch
         stderr_lines = [line for line in (proc.stderr or "").strip().splitlines() if line.strip()]
         last = stderr_lines[-1] if stderr_lines else "(no stderr)"
-        return [], f"exit {proc.returncode}: {last[:300]}"
-    return parse_gallerydl_stdout(proc.stdout or "")
+        return {tag: ([], f"exit {proc.returncode}: {last[:300]}") for tag in tags}
+    parsed = parse_gallerydl_batch(proc.stdout or "")
+    results: dict[str, tuple[list[dict], str | None]] = {}
+    for tag in tags:
+        # a tag missing from the output means the runner died mid-batch
+        results[tag] = parsed.get(tag, ([], "no output for tag (runner exited early)"))
+    return results
+
+
+def parse_gallerydl_batch(stdout: str) -> dict[str, tuple[list[dict], str | None]]:
+    """Split merged runner output into per-tag results.
+
+    The runner prints `@@@TAG:<tag>` followed by that tag's single JSON
+    envelope (the exact shape `gallery-dl -j` emits); each envelope is
+    delegated to parse_gallerydl_stdout.
+    """
+    results: dict[str, tuple[list[dict], str | None]] = {}
+    current: str | None = None
+    chunks: dict[str, list[str]] = {}
+    for line in (stdout or "").splitlines():
+        if line.startswith(BATCH_TAG_PREFIX):
+            current = line[len(BATCH_TAG_PREFIX):].strip()
+            chunks.setdefault(current, [])
+            continue
+        if current is not None:
+            chunks[current].append(line)
+    for tag, lines in chunks.items():
+        results[tag] = parse_gallerydl_stdout("\n".join(lines))
+    return results
 
 
 def parse_gallerydl_stdout(stdout: str) -> tuple[list[dict], str | None]:

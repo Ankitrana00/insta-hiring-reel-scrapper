@@ -9,7 +9,6 @@ generation, review flow (--auto + resume), and the push column contract.
 """
 
 import json
-import sys
 import tempfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -328,8 +327,8 @@ def test_cmd_scrape_dedupes_across_days_and_drops_old_reels(tmp_path, monkeypatc
                 "description": "hiring in Noida right now", "username": "u"}
 
     items = [reel("NEW1", 2), reel("DUP1", 1), reel("OLD1", 72)]
-    monkeypatch.setattr(reels.common, "run_gallerydl_tag",
-                        lambda cfg, tag, timeout, tabs=("clips",): (items, None))
+    monkeypatch.setattr(reels.common, "run_gallerydl_batch",
+                        lambda cfg, tags_, timeout, tabs=("clips",): {t: (items, None) for t in tags_})
     out = tmp_path / "out"
     monkeypatch.setattr(reels, "OUT_DIR", out)
     out.mkdir()
@@ -346,6 +345,76 @@ def test_cmd_scrape_dedupes_across_days_and_drops_old_reels(tmp_path, monkeypatc
     rows = common.read_ndjson(expected_raw)
     assert {r["shortcode"] for r in rows} == {"NEW1"}  # DUP1 seen before; OLD1 too old
     assert all(r["media_type"] == "reel" for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# batch runner — one process, per-tag isolation
+# ---------------------------------------------------------------------------
+
+def test_parse_gallerydl_batch_splits_tags_and_isolates_abort():
+    stdout = (
+        "@@@TAG:good\n" + _rest_envelope() + "\n"
+        "@@@TAG:wall\n" + ABORT_ENVELOPE + "\n"
+        "@@@TAG:empty\n[]\n"
+    )
+    res = common.parse_gallerydl_batch(stdout)
+    assert set(res) == {"good", "wall", "empty"}
+    assert res["good"][1] is None and len(res["good"][0]) == 8
+    assert res["wall"][0] == [] and "login page" in res["wall"][1]
+    assert res["empty"] == ([], None)
+
+
+def test_run_gallerydl_batch_isolates_per_tag_failures(tmp_path, monkeypatch):
+    class Proc:
+        returncode = 0
+        stdout = ("@@@TAG:good\n" + json.dumps(
+            [[2, {"post_shortcode": "A1", "type": "reel", "count": 1, "date": 1730000000,
+                  "description": "hiring in delhi", "username": "u",
+                  "post_url": "https://www.instagram.com/reel/A1/"}]]) + "\n"
+            + "@@@TAG:bad\n" + ABORT_ENVELOPE + "\n")
+        stderr = ""
+
+    monkeypatch.setattr(common.subprocess, "run", lambda *a, **k: Proc())
+    res = common.run_gallerydl_batch(tmp_path / "c.json", ["good", "bad"], 60)
+    assert res["good"][1] is None and res["good"][0][0]["post_shortcode"] == "A1"
+    assert res["bad"][1] is not None and "login page" in res["bad"][1]
+
+
+def test_run_gallerydl_batch_timeout_fails_all_tags(tmp_path, monkeypatch):
+    def raise_timeout(*a, **k):
+        raise common.subprocess.TimeoutExpired(cmd="gdl_run", timeout=9)
+
+    monkeypatch.setattr(common.subprocess, "run", raise_timeout)
+    res = common.run_gallerydl_batch(tmp_path / "c.json", ["a", "b"], 60)
+    assert set(res) == {"a", "b"}
+    assert all("timeout" in res[t][1] for t in ("a", "b"))
+
+
+def test_run_gallerydl_batch_crash_with_no_output_fails_all(tmp_path, monkeypatch):
+    class Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "boom"
+
+    monkeypatch.setattr(common.subprocess, "run", lambda *a, **k: Proc())
+    res = common.run_gallerydl_batch(tmp_path / "c.json", ["a", "b"], 60)
+    assert all("exit 1" in res[t][1] for t in ("a", "b"))
+
+
+def test_run_gallerydl_batch_missing_tag_reported_as_failure(tmp_path, monkeypatch):
+    class Proc:
+        returncode = 0
+        stdout = "@@@TAG:a\n[]\n"  # tag "b" never reported — runner died mid-batch
+        stderr = ""
+
+    monkeypatch.setattr(common.subprocess, "run", lambda *a, **k: Proc())
+    res = common.run_gallerydl_batch(tmp_path / "c.json", ["a", "b"], 60)
+    assert res["a"] == ([], None)
+    assert "no output" in res["b"][1]
+
+
+def test_run_gallerydl_batch_empty_tags_is_noop(tmp_path):
+    assert common.run_gallerydl_batch(tmp_path / "c.json", [], 60) == {}
 
 
 # ---------------------------------------------------------------------------
