@@ -90,15 +90,26 @@ def cmd_scrape(args: argparse.Namespace) -> None:
     # only worth fetching when --all-types keeps them.
     tabs_str = args.tabs or os.environ.get("REELS_TABS", "") or ("recent,clips" if args.all_types else "clips")
     tabs = tuple(t.strip().lower() for t in tabs_str.split(",") if t.strip()) or ("clips",)
+    try:
+        max_age_days = float(args.max_age if args.max_age is not None else os.environ.get("REELS_MAX_AGE_DAYS", "1"))
+    except ValueError:
+        max_age_days = 1.0
 
     tags = select_tags(args, batch_size)
     OUT_DIR.mkdir(exist_ok=True)
     today = date.today().strftime("%Y%m%d")
     raw_path = OUT_DIR / f"raw-{today}.ndjson"
 
-    existing_rows = common.read_ndjson(raw_path)
-    seen_shortcodes = {r.get("shortcode") for r in existing_rows}
-    done_tags = {r.get("hashtag_source") for r in existing_rows}
+    # Cross-day dedupe: a shortcode seen in ANY previous raw/approved file is
+    # skipped — the rotation cycle resurfaces tags, and the review queue must
+    # never show the same reel twice. (The DB upsert is idempotent on
+    # shortcode regardless; this keeps the local artifacts clean.)
+    seen_shortcodes: set[str] = set()
+    for history in sorted(OUT_DIR.glob("raw-*.ndjson")) + sorted(OUT_DIR.glob("approved-*.ndjson")):
+        for row in common.read_ndjson(history):
+            if row.get("shortcode"):
+                seen_shortcodes.add(str(row["shortcode"]))
+    done_tags = {r.get("hashtag_source") for r in common.read_ndjson(raw_path)}
 
     if not session_id:
         print(
@@ -123,16 +134,19 @@ def cmd_scrape(args: argparse.Namespace) -> None:
             errors.append(f"{tag}: {err}")
             print(f"[{tag}] FAILED — {err}", file=sys.stderr, flush=True)
             continue
-        kept_rows, dropped = filter_media(common.rows_from_items(items, tag), args.all_types)
-        fresh = [r for r in kept_rows if r["shortcode"] not in seen_shortcodes]
-        common.append_ndjson(raw_path, fresh)
-        seen_shortcodes.update(r["shortcode"] for r in fresh)
+        reel_rows, dropped = filter_media(common.rows_from_items(items, tag), args.all_types)
+        fresh_rows, stale = common.filter_fresh(reel_rows, max_age_days)
+        new_rows = [r for r in fresh_rows if r["shortcode"] not in seen_shortcodes]
+        dup_count = len(fresh_rows) - len(new_rows)
+        common.append_ndjson(raw_path, new_rows)
+        seen_shortcodes.update(r["shortcode"] for r in new_rows)
         ok += 1
-        if args.all_types:
-            print(f"[{tag}] {len(kept_rows)} posts ({len(fresh)} new)", flush=True)
-        else:
-            total = len(kept_rows) + dropped
-            print(f"[{tag}] {len(kept_rows)}/{total} reels kept ({dropped} non-reel dropped, {len(fresh)} new)", flush=True)
+        kind = "posts" if args.all_types else "reels"
+        parts = [f"{stale} older than {max_age_days:g}d", f"{dup_count} seen before", f"{len(new_rows)} new"]
+        if not args.all_types:
+            parts.insert(0, f"{dropped} non-reel dropped")
+        total = len(reel_rows) + dropped
+        print(f"[{tag}] {len(fresh_rows)}/{total} {kind} kept ({', '.join(parts)})", flush=True)
 
     all_rows = common.read_ndjson(raw_path)
     review_path = OUT_DIR / f"review-{today}.html"
@@ -333,6 +347,9 @@ def build_parser() -> argparse.ArgumentParser:
     scrape.add_argument("--max-posts", type=int, default=None, help="posts per hashtag (default 12)")
     scrape.add_argument("--all-types", action="store_true",
                         help="also keep image/carousel/video posts (default: reels only)")
+    scrape.add_argument("--max-age", type=float, default=None,
+                        help="keep only reels posted within the last N days (default 1; "
+                             "undated reels are dropped too; REELS_MAX_AGE_DAYS overrides)")
     scrape.add_argument("--tabs", default=None,
                         help='hashtag tabs to fetch: "clips" (reels) and/or "recent" (grid). '
                              'Default: clips, or recent+clips with --all-types')

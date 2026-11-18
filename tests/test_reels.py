@@ -11,7 +11,7 @@ generation, review flow (--auto + resume), and the push column contract.
 import json
 import sys
 import tempfile
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -282,6 +282,73 @@ def test_filter_media_empty_rows():
 
 
 # ---------------------------------------------------------------------------
+# freshness filter — "only reels from the last day"
+# ---------------------------------------------------------------------------
+
+def test_filter_fresh_keeps_only_last_day():
+    now = datetime(2026, 11, 8, 12, 0, tzinfo=timezone.utc)
+    rows = [
+        {"shortcode": "FRESH", "posted_at": "2026-11-08T10:00:00Z"},   # 2h old
+        {"shortcode": "EDGE", "posted_at": "2026-11-07T12:00:00Z"},    # exactly 1d → kept
+        {"shortcode": "OLD", "posted_at": "2026-11-05T00:00:00Z"},     # 3.5d → dropped
+        {"shortcode": "NAIVE", "posted_at": "2026-11-08 09:00:00"},    # naive → treated as UTC
+        {"shortcode": "UNDATED", "posted_at": None},                   # undated → dropped
+    ]
+    kept, stale = common.filter_fresh(rows, 1.0, now=now)
+    assert {r["shortcode"] for r in kept} == {"FRESH", "EDGE", "NAIVE"}
+    assert stale == 2
+
+
+def test_filter_fresh_custom_window():
+    now = datetime(2026, 11, 8, 12, 0, tzinfo=timezone.utc)
+    rows = [{"shortcode": "W", "posted_at": "2026-11-06T00:00:00Z"}]  # 2.5d old
+    kept, stale = common.filter_fresh(rows, 3.0, now=now)
+    assert [r["shortcode"] for r in kept] == ["W"]
+    assert stale == 0
+
+
+def test_filter_fresh_empty():
+    assert common.filter_fresh([], 1.0) == ([], 0)
+
+
+# ---------------------------------------------------------------------------
+# cmd_scrape — freshness + cross-day dedupe end-to-end (gallery-dl mocked)
+# ---------------------------------------------------------------------------
+
+def test_cmd_scrape_dedupes_across_days_and_drops_old_reels(tmp_path, monkeypatch):
+    monkeypatch.setenv("REELS_MAX_AGE_DAYS", "1")
+    monkeypatch.setattr(reels, "load_env", lambda: None)
+    monkeypatch.setattr(reels, "require_gallerydl", lambda: None)
+    now = datetime.now(timezone.utc)
+
+    def reel(code, hours_old):
+        return {"post_shortcode": code, "type": "reel", "count": 1,
+                "date": int((now - timedelta(hours=hours_old)).timestamp()),
+                "post_url": f"https://www.instagram.com/reel/{code}/",
+                "description": "hiring in Noida right now", "username": "u"}
+
+    items = [reel("NEW1", 2), reel("DUP1", 1), reel("OLD1", 72)]
+    monkeypatch.setattr(reels.common, "run_gallerydl_tag",
+                        lambda cfg, tag, timeout, tabs=("clips",): (items, None))
+    out = tmp_path / "out"
+    monkeypatch.setattr(reels, "OUT_DIR", out)
+    out.mkdir()
+    # yesterday's raw file already contains DUP1 — a resurfaced reel
+    yesterday = (now - timedelta(days=1)).strftime("%Y%m%d")
+    common.append_ndjson(out / f"raw-{yesterday}.ndjson", [{"shortcode": "DUP1"}])
+
+    ns = type("Args", (), {"tags": "startupjobs", "all": False, "max_posts": None,
+                           "all_types": False, "tabs": None, "max_age": None,
+                           "force": False})()
+    reels.cmd_scrape(ns)
+
+    expected_raw = out / f"raw-{date.today().strftime('%Y%m%d')}.ndjson"
+    rows = common.read_ndjson(expected_raw)
+    assert {r["shortcode"] for r in rows} == {"NEW1"}  # DUP1 seen before; OLD1 too old
+    assert all(r["media_type"] == "reel" for r in rows)
+
+
+# ---------------------------------------------------------------------------
 # daily rotation
 # ---------------------------------------------------------------------------
 
@@ -297,8 +364,9 @@ class _FixedNow:
 def test_select_tags_daily_rotation_covers_whole_watchlist(monkeypatch):
     monkeypatch.setattr(reels, "datetime", _FixedNow)
     args = type("Args", (), {"tags": None, "all": False})()
+    days = -(-len(watchlist.WATCHLIST) // 10)  # ceil(len/batch) — the full cycle
     seen = set()
-    for day in range(4):  # 40 tags / batch 10 → 4-day cycle
+    for day in range(days):
         _FixedNow._fake = datetime(2026, 1, 1 + day, 12, 0, 0)
         batch = reels.select_tags(args, 10)
         assert len(batch) == 10

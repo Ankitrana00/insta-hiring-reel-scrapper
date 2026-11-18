@@ -44,6 +44,14 @@ WATCHLIST: list[str] = [
     "kolkatajobs",
     "ahmedabadjobs",
     "jaipurjobs",
+    # jobsin<city> variants — second pass over the key metros
+    "jobsindelhi",
+    "jobsinnoida",
+    "jobsingurugram",
+    "jobsinfaridabad",
+    "jobsinmumbai",
+    "jobsinbangalore",
+    "jobsinpune",
     # work modes / seniority
     "remotejobsindia",
     "workfromhomeindia",

@@ -16,7 +16,7 @@ import json
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -287,6 +287,55 @@ def post_url_for(row: dict) -> str:
     if row.get("media_type") in ("reel", "igtv"):
         return f"https://www.instagram.com/reel/{shortcode}/"
     return f"https://www.instagram.com/p/{shortcode}/"
+
+
+# ---------------------------------------------------------------------------
+# Freshness filter — the daily-curation goal: only recently-posted reels
+# ---------------------------------------------------------------------------
+
+
+def _posted_datetime(row: dict) -> datetime | None:
+    """Parse a row's posted_at into an aware UTC datetime (or None).
+
+    Handles both emitted shapes: ISO strings (…Z) and the naive
+    `2026-04-05 07:07:24` form the REST lane emits — naive values are treated
+    as UTC, matching gallery-dl's date semantics.
+    """
+    ts = row.get("posted_at")
+    if not ts:
+        return None
+    text = str(ts).strip()
+    parsed: datetime | None = None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            parsed = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def filter_fresh(rows: list[dict], max_age_days: float = 1.0,
+                 now: datetime | None = None) -> tuple[list[dict], int]:
+    """Keep only reels posted within `max_age_days` of `now` (default 1 day).
+
+    Rows with no parseable posted_at count as stale and are dropped too —
+    an undated reel can't be proven fresh. Returns (kept, dropped_count).
+    """
+    now = now or datetime.now(timezone.utc)
+    cutoff = timedelta(days=max_age_days)
+    kept: list[dict] = []
+    stale = 0
+    for row in rows:
+        ts = _posted_datetime(row)
+        if ts is None or (now - ts) > cutoff:
+            stale += 1
+            continue
+        kept.append(row)
+    return kept, stale
 
 
 # ---------------------------------------------------------------------------

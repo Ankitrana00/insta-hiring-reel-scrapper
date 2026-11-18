@@ -17,14 +17,16 @@ machine; a residential IP is also the least ban-prone way to talk to Instagram.
 ## How it works
 
 ```
-watchlist.py (40 India hiring hashtags)
-        │  daily batch = 10 tags, rotated by day-of-year
+watchlist.py (47 India hiring hashtags)
+        │  daily batch = 10 tags, rotated by day-of-year (full cycle every 5 days)
         ▼
 gdl_run.py ── in-process gallery-dl runner
         │    fetches the hashtag "clips" tab (where REELS live — the stock
         │    gallery-dl runner only walks the "recent" image grid)
         ▼
 common.py ── parse → group per post (post_shortcode) → reels-only filter
+        │    → freshness gate (posted within the last day; REELS_MAX_AGE_DAYS)
+        │    → cross-day dedupe (shortcodes seen in any earlier file are skipped)
         │    → caption job-signal parsing (keywords, city, links, emails)
         ▼
 out/raw-<date>.ndjson          +  out/review-<date>.html  (visual check)
@@ -43,7 +45,7 @@ public.job_reels (Supabase) → the app's S9 board reads it
 | `reels.py` | CLI entry — `scrape` / `review` / `push` subcommands |
 | `common.py` | gallery-dl output parser, post grouping, caption→job-signals, review-HTML generator |
 | `gdl_run.py` | in-process gallery-dl runner — fetches the **clips tab**; prints the same JSON envelope `gallery-dl -j` would |
-| `watchlist.py` | the 40 India hiring hashtags for the daily rotation |
+| `watchlist.py` | the 47 India hiring hashtags for the daily rotation |
 | `requirements.txt` | `gallery-dl`, `requests`, `python-dotenv` |
 | `.env` | **secrets** — sessionid (+ optional Supabase keys). Never leaves this folder |
 | `.env.example` | template documenting every variable |
@@ -97,13 +99,14 @@ cd hiring-reels-scraper
 | `--max-posts N` | posts per hashtag (default 12; counts all types before the reel filter) |
 | `--all-types` | keep image/carousel/video posts too; also fetches the `recent` grid alongside `clips` |
 | `--tabs clips,recent` | manual tab override (`top` aborts — upstream parser bug) |
+| `--max-age N` | keep only reels posted within N days (default **1**; undated reels are dropped too) |
 | `--force` | re-scrape tags already done today |
 
 Env knobs in `.env`: `REELS_MAX_POSTS` (12), `REELS_BATCH_SIZE` (10),
-`REELS_TAG_TIMEOUT` (180s), `REELS_TABS` (`clips`).
+`REELS_TAG_TIMEOUT` (180s), `REELS_TABS` (`clips`), `REELS_MAX_AGE_DAYS` (1).
 
-Per-tag output line tells you the yield: `[startupjobs] 4/12 reels kept
-(8 non-reel dropped, 4 new)`.
+Per-tag output line tells you the full yield: `[startupjobs] 3/12 reels kept
+(8 non-reel dropped, 2 older than 1d, 1 seen before, 3 new)`.
 
 ### `review` — the human gate
 
@@ -202,8 +205,11 @@ drive move, recreate it with `py -3 -m venv .venv && pip install -r requirements
   gallery-dl's 6–12s request sleeps, small daily batches, no media downloads.
 - **Keep gallery-dl fresh:** Instagram extractors break often —
   `pip install -U gallery-dl` when tags start failing en masse.
-- **Old resurfaced reels happen** (a hiring tag can serve a 2021 meme) — check
-  `posted_at` in review.
+- **Old resurfaced reels are auto-dropped** (hiring tags can serve a 2021
+  meme) — the freshness gate keeps only the last day by default; raise it via
+  `--max-age` / `REELS_MAX_AGE_DAYS` if a tag yields too little.
+- **No duplicates, ever:** a shortcode seen in any previous raw/approved file
+  is skipped at scrape time, and the DB upsert is idempotent on `shortcode`.
 - **Captions are Hinglish** — Devanagari + emoji rendering assumed downstream.
 
 ## Troubleshooting
