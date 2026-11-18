@@ -353,7 +353,7 @@ def browser_item_to_row(item: dict, hashtag: str) -> dict | None:
         media_type = "post"
     user = item.get("user") or {}
     candidates = (item.get("image_versions2") or {}).get("candidates") or []
-    sized = [c for c in candidates if c.get("width")]
+    sized = [c for c in candidates if c.get("width") and c["width"] >= 320]
     thumbnail = (min(sized, key=lambda c: c["width"]) if sized else None) or candidates[-1] if candidates else None
     taken = item.get("taken_at")
     posted_at = (
