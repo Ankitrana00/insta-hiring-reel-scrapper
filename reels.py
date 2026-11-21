@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -442,6 +443,116 @@ def cmd_accounts(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# hashtag-browser lane — tag data via the bound browser's network capture
+# (Instagram moved tag media from /api/v1/tags/.../sections/ to /api/graphql;
+# this lane reads the browser's own graphql responses — drift-resistant)
+# ---------------------------------------------------------------------------
+
+
+def _browser_graphql_bodies(opencli_bin: str, session: str, processed_keys: set) -> dict:
+    """Return {key: parsed_body} for NEW graphql responses in the browser capture."""
+    out = subprocess.run(
+        [opencli_bin, "browser", "network", "--session", session],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+    ).stdout
+    data = json.loads(out).get("data", {})
+    results = {}
+    for entry in data.get("entries", []):
+        key = str(entry.get("key"))
+        if "graphql" not in str(entry.get("url")) or key in processed_keys:
+            continue
+        detail = subprocess.run(
+            [opencli_bin, "browser", "network", "--session", session, "--detail", key],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+        ).stdout
+        try:
+            envelope = json.loads(detail)
+            body = envelope.get("data", {})
+            results[key] = json.loads(body) if isinstance(body, str) else body
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return results
+
+
+def cmd_hashtag_browser(args: argparse.Namespace) -> None:
+    """Hashtag lane through the bound browser: open tag pages, scroll, and
+    harvest the media from the page's own /api/graphql responses."""
+    load_env()
+    opencli_bin = _find_opencli()
+    session = args.session
+    tags = [t.strip().lstrip("#") for t in (args.tags.split(",") if args.tags else watchlist.WATCHLIST) if t.strip()]
+
+    OUT_DIR.mkdir(exist_ok=True)
+    today = date.today().strftime("%Y%m%d")
+    raw_path = OUT_DIR / f"raw-{today}.ndjson"
+    seen_shortcodes = set()
+    for history in sorted(OUT_DIR.glob("raw-*.ndjson")) + sorted(OUT_DIR.glob("approved-*.ndjson")):
+        for row in common.read_ndjson(history):
+            if row.get("shortcode"):
+                seen_shortcodes.add(str(row["shortcode"]))
+    try:
+        max_age_days = float(args.max_age if args.max_age is not None else os.environ.get("REELS_MAX_AGE_DAYS", "1"))
+    except ValueError:
+        max_age_days = 1.0
+
+    errors = []
+    ok = 0
+    processed_keys = set()
+    for tag in tags:
+        print(f"[#{tag}] opening tag page in browser...", flush=True)
+        try:
+            subprocess.run(
+                [opencli_bin, "browser", "open", "--session", session,
+                 "https://www.instagram.com/explore/tags/" + tag + "/"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=args.timeout,
+            )
+            for _ in range(args.scrolls):
+                time.sleep(2)
+                subprocess.run([opencli_bin, "browser", "scroll", "--session", session, "down"],
+                               capture_output=True, text=True, timeout=60)
+            graph = _browser_graphql_bodies(opencli_bin, session, set())
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            errors.append("#" + tag + ": " + str(exc))
+            print("[" + tag + "] FAILED - " + str(exc), file=sys.stderr, flush=True)
+            continue
+        rows = []
+        for body in graph.values():
+            rows.extend(common.rows_from_browser_capture(body, tag))
+        if not rows:
+            print("[" + tag + "] no media captured (page still loading? increase --scrolls)", flush=True)
+            continue
+        reel_rows, dropped = filter_media(rows, args.all_types)
+        fresh_rows, stale = common.filter_fresh(reel_rows, max_age_days)
+        new_rows = [r for r in fresh_rows if r["shortcode"] not in seen_shortcodes]
+        dup_count = len(fresh_rows) - len(new_rows)
+        common.append_ndjson(raw_path, new_rows)
+        seen_shortcodes.update(r["shortcode"] for r in new_rows)
+        ok += 1
+        kind = "posts" if args.all_types else "reels"
+        parts = [str(stale) + " older than " + str(max_age_days) + "d",
+                 str(dup_count) + " seen before", str(len(new_rows)) + " new"]
+        if not args.all_types:
+            parts.insert(0, str(dropped) + " non-reel dropped")
+        total = len(reel_rows) + dropped
+        print("[" + tag + "] " + str(len(fresh_rows)) + "/" + str(total) + " " + kind
+              + " kept (" + ", ".join(parts) + ")", flush=True)
+
+    all_rows = common.read_ndjson(raw_path)
+    review_path = OUT_DIR / ("review-" + today + ".html")
+    common.render_review_html(all_rows, review_path)
+
+    print("Tags: " + str(len(tags)) + " - ok " + str(ok) + ", failed " + str(len(errors)))
+    if errors:
+        err_log = OUT_DIR / ("errors-" + today + ".log")
+        err_log.write_text("\n".join(errors) + "\n", encoding="utf-8")
+        print("Error details: " + str(err_log))
+    print("Raw file:    " + str(raw_path))
+    print(f"Review file: {review_path}")
+    print(f"Next:        py -3 reels.py review {raw_path.name}")
+
+
+# ---------------------------------------------------------------------------
 # review
 # ---------------------------------------------------------------------------
 
@@ -660,6 +771,15 @@ def build_parser() -> argparse.ArgumentParser:
     acc.add_argument("--all-types", action="store_true", help="also keep non-reel posts (default: reels only)")
     acc.add_argument("--max-age", type=float, default=None, help="keep only posts from the last N days (default 1)")
     acc.set_defaults(func=cmd_accounts)
+
+    hb = sub.add_parser("hashtag-browser", help="hashtag lane via the bound browser (network capture) - works while the API lane is dead")
+    hb.add_argument("--tags", default=None, help="comma-separated hashtags (default: full watchlist)")
+    hb.add_argument("--scrolls", type=int, default=4, help="scroll passes per tag to load more reels (default 4)")
+    hb.add_argument("--session", default="ig", help="bound browser session name (default ig)")
+    hb.add_argument("--timeout", type=float, default=120, help="seconds per page operation (default 120)")
+    hb.add_argument("--all-types", action="store_true", help="also keep non-reel posts (default: reels only)")
+    hb.add_argument("--max-age", type=float, default=None, help="keep only posts from the last N days (default 1)")
+    hb.set_defaults(func=cmd_hashtag_browser)
     return parser
 
 
