@@ -89,7 +89,7 @@ def cmd_scrape(args: argparse.Namespace) -> None:
     require_gallerydl()
     session_id = (os.environ.get("IG_SESSIONID") or "").strip()
     max_posts = args.max_posts or int(os.environ.get("REELS_MAX_POSTS", "12"))
-    batch_size = int(os.environ.get("REELS_BATCH_SIZE", "10"))
+    batch_size = int(os.environ.get("REELS_BATCH_SIZE", "15"))
     tag_timeout = float(os.environ.get("REELS_TAG_TIMEOUT", "180"))
     # "clips" is where hashtag reels live; "recent" (grid) is mostly images —
     # only worth fetching when --all-types keeps them.
